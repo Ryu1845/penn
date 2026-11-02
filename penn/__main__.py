@@ -77,7 +77,7 @@ def parse_args():
         '--num_workers',
         type=int,
         default=0,
-        help='Number of CPU threads for async data I/O')
+        help='Number of CPU worker processes for audio decoding')
     parser.add_argument(
         '--gpu',
         type=int,
@@ -86,4 +86,5 @@ def parse_args():
     return parser.parse_known_args()[0]
 
 
-penn.from_files_to_files(**vars(parse_args()))
+if __name__ == '__main__':
+    penn.from_files_to_files(**vars(parse_args()))

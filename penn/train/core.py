@@ -65,7 +65,7 @@ def train(datasets, directory, gpu=None):
     #########
 
     # Automatic mixed precision (amp) gradient scaler
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device.type)
 
     # Setup progress bar
     progress = torchutil.iterator(

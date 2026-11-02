@@ -25,7 +25,7 @@ def from_audio(
         import pyworld
 
         # Convert to numpy
-        audio = audio.numpy().squeeze().astype(np.float)
+        audio = audio.numpy().squeeze().astype(np.float64)
 
         # Get pitch
         pitch, times  = pyworld.dio(

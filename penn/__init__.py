@@ -24,6 +24,7 @@ from .config.static import *
 ###############################################################################
 
 
+from . import viterbi
 from .core import *
 from .model import Model
 from .train import loss, train

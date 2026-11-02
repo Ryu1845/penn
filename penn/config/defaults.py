@@ -67,6 +67,9 @@ MAX_OCTAVES_PER_SECOND = 32.
 # Maximum chunk size for chunked Viterbi decoding
 VITERBI_MIN_CHUNK_SIZE = None
 
+# Minimum number of frames to accumulate before batch decoding many signals
+DECODER_BATCH_FRAMES = 32768
+
 
 ###############################################################################
 # Directories
@@ -109,7 +112,7 @@ DATASETS = ['mdb', 'ptdb']
 # Method to use for evaluation
 METHOD = 'penn'
 
-# Batch size to use for evaluation
+# Batch size to use for evaluation and the default inference batch size
 EVALUATION_BATCH_SIZE = 2048
 
 # Datsets to use for evaluation
@@ -129,6 +132,9 @@ PERIODICITY = 'entropy'
 # Model parameters
 ###############################################################################
 
+
+# Whether to compile the model with torch.compile for CUDA inference
+COMPILE = True
 
 # The dropout rate. Set to None to turn off dropout.
 DROPOUT = None

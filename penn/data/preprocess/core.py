@@ -2,7 +2,6 @@ import itertools
 import warnings
 
 import numpy as np
-import torchaudio
 import torchutil
 
 import penn
@@ -79,10 +78,7 @@ def mdb():
             audio.numpy().squeeze())
 
         # Save audio for listening and evaluation
-        torchaudio.save(
-            output_directory / f'{stem}.wav',
-            audio,
-            penn.SAMPLE_RATE)
+        save_audio(output_directory / f'{stem}.wav', audio)
 
         # Load pitch
         annotations = np.loadtxt(open(pitch_file), delimiter=',')
@@ -142,7 +138,7 @@ def ptdb():
         stem = f'{i:06d}'
 
         # Load and resample to PTDB sample rate
-        audio, sample_rate = torchaudio.load(audio_file)
+        audio, sample_rate = penn.load.read(audio_file)
         audio = penn.resample(audio, sample_rate, PTDB_SAMPLE_RATE)
 
         # Remove padding
@@ -160,10 +156,7 @@ def ptdb():
             audio.numpy().squeeze())
 
         # Save audio for listening and evaluation
-        torchaudio.save(
-            output_directory / f'{stem}.wav',
-            audio,
-            penn.SAMPLE_RATE)
+        save_audio(output_directory / f'{stem}.wav', audio)
 
         # Load pitch
         pitch = np.loadtxt(open(pitch_file), delimiter=' ')[:, 0]
@@ -201,6 +194,12 @@ def ptdb():
 ###############################################################################
 # Utilities
 ###############################################################################
+
+
+def save_audio(file, audio, sample_rate=penn.SAMPLE_RATE):
+    """Save audio to disk as 16-bit PCM"""
+    from torchcodec.encoders import AudioEncoder
+    AudioEncoder(audio, sample_rate=sample_rate).to_file(file)
 
 
 def interpolate_unvoiced(pitch):

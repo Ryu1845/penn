@@ -16,6 +16,7 @@ Training, evaluation, and inference of neural pitch and periodicity estimators i
 - [Inference](#inference)
     * [Application programming interface](#application-programming-interface)
         * [`penn.from_audio`](#pennfrom_audio)
+        * [`penn.from_audios`](#pennfrom_audios)
         * [`penn.from_file`](#pennfrom_file)
         * [`penn.from_file_to_file`](#pennfrom_file_to_file)
         * [`penn.from_files_to_files`](#pennfrom_files_to_files)
@@ -40,6 +41,8 @@ If you want to perform pitch estimation using a pretrained FCNF0++ model, run
 If you want to train or use your own models, run
 `pip install penn[train]`
 
+Loading audio from disk uses [TorchCodec](https://github.com/pytorch/torchcodec), which requires FFmpeg (e.g., `sudo apt install ffmpeg` or `conda install ffmpeg`). Inference on audio tensors does not require FFmpeg. Python 3.12 or later and PyTorch 2.15 or later are required.
+
 
 ## Inference
 
@@ -49,7 +52,7 @@ Perform inference using FCNF0++
 import penn
 
 # Load audio
-audio, sample_rate = torchaudio.load('test/assets/gershwin.wav')
+audio, sample_rate = penn.load.read('test/assets/gershwin.wav')
 
 # Here we'll use a 10 millisecond hopsize
 hopsize = .01
@@ -93,7 +96,9 @@ pitch, periodicity = penn.from_audio(
     gpu=gpu)
 ```
 
-Note that pitch estimation is performed independently on each frame of audio. Then, a _decoding_ step occurs, which may or may not be computed independently on each frame. Most often, Viterbi decoding is used (as in, e.g., PYIN and CREPE). However, Viterbi decoding is slow. We made a fast Viterbi decoder called [torbi](https://github.com/maxrmorrison/torbi), which [we are working on adding to PyTorch](https://github.com/pytorch/pytorch/issues/121160). Until `torbi` is integrated into PyTorch (or otherwise made pip-installable), it is recommended to use the `dev` branch of `penn`, which uses `torbi` decoding by default, but is not pip-installable. Our paper [_Fine-Grained and Interpretable Neural Speech Editing_](https://www.maxrmorrison.com/sites/promonet/) introduces and demonstrates the efficacy of `torbi` for pitch decoding. 
+Note that pitch estimation is performed independently on each frame of audio. Then, a _decoding_ step occurs, which may or may not be computed independently on each frame. Most often, Viterbi decoding is used (as in, e.g., PYIN and CREPE). `penn` includes a banded Viterbi decoder (`penn.viterbi.decode`) that exploits the bounded pitch velocity of the transition matrix. On CUDA, it runs as a Triton kernel that decodes each sequence in a single launch; otherwise it runs in PyTorch.
+
+On CUDA, the network is compiled with `torch.compile` by default. The first call compiles the network, which takes tens of seconds. Disable compilation by setting `COMPILE = False` in a configuration file. For the highest throughput on many signals, use `penn.from_audios` or `penn.from_files_to_files`. These pack frames of many signals into full batches and decode many signals in one Viterbi call.
 
 
 ### Application programming interface
@@ -133,6 +138,50 @@ Returns:
         shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
     periodicity: torch.tensor(
         shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
+"""
+```
+
+
+#### `penn.from_audios`
+
+```
+def from_audios(
+    audios: Sequence[torch.Tensor],
+    sample_rate: Union[int, Sequence[int]] = penn.SAMPLE_RATE,
+    hopsize: float = penn.HOPSIZE_SECONDS,
+    fmin: float = penn.FMIN,
+    fmax: float = penn.FMAX,
+    checkpoint: Optional[Path] = None,
+    batch_size: Optional[int] = None,
+    center: str = 'half-window',
+    decoder: str = penn.DECODER,
+    interp_unvoiced_at: Optional[float] = None,
+    gpu: Optional[int] = None
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+"""Perform batched pitch and periodicity estimation on many signals
+
+Frames from all signals are packed into shared fixed-size batches for the
+network, and many signals are decoded in a single batched Viterbi call.
+
+Args:
+    audios: The audio signals to extract pitch and periodicity from
+    sample_rate: The audio sample rate, or one sample rate per signal
+    hopsize: The hopsize in seconds
+    fmin: The minimum allowable frequency in Hz
+    fmax: The maximum allowable frequency in Hz
+    checkpoint: The checkpoint file
+    batch_size: The number of frames per batch
+    center: Padding options. One of ['half-window', 'half-hop', 'zero'].
+    decoder: Posteriorgram decoder. One of ['argmax', 'pyin', 'viterbi'].
+    interp_unvoiced_at: Specifies voicing threshold for interpolation
+    gpu: The index of the gpu to run inference on
+
+Returns:
+    List of (pitch, periodicity) for each signal, where
+        pitch: torch.tensor(
+            shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
+        periodicity: torch.tensor(
+            shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
 """
 ```
 
@@ -219,7 +268,7 @@ def from_files_to_files(
     center: str = 'half-window',
     decoder: str = penn.DECODER,
     interp_unvoiced_at: Optional[float] = None,
-    num_workers: int = penn.NUM_WORKERS,
+    num_workers: int = 0,
     gpu: Optional[int] = None
 ) -> None:
 """Perform pitch and periodicity estimation from files on disk and save
@@ -234,7 +283,7 @@ Args:
     batch_size: The number of frames per batch
     center: Padding options. One of ['half-window', 'half-hop', 'zero'].
     interp_unvoiced_at: Specifies voicing threshold for interpolation
-    num_workers: Number of CPU threads for async data I/O
+    num_workers: Number of CPU worker processes for audio decoding
     gpu: The index of the gpu to run inference on
 """
 ```
@@ -287,8 +336,8 @@ optional arguments:
         Posteriorgram decoder
     --interp_unvoiced_at INTERP_UNVOICED_AT
         Specifies voicing threshold for interpolation. Defaults to 0.1625.
-    --num_workers
-        Number of CPU threads for async data I/O
+    --num_workers NUM_WORKERS
+        Number of CPU worker processes for audio decoding
     --gpu GPU
         The index of the gpu to perform inference on. Defaults to CPU.
 ```
