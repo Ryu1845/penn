@@ -1,14 +1,22 @@
+import collections
+import concurrent.futures
 import contextlib
+import dataclasses
 import functools
 import math
-import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import (
+    Any,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union)
 
 import huggingface_hub
 import torch
-import torch.multiprocessing as mp
-import torchaudio
 import torchutil
 
 import penn
@@ -53,79 +61,83 @@ def from_audio(
         periodicity: torch.tensor(
             shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
     """
-    device = 'cpu' if gpu is None else f'cuda:{gpu}'
-
-    # Storage for batching
-    if batch_size is not None:
-        if decoder == 'argmax':
-            pitch, periodicity = [], []
-        else:
-            logits = []
-
-    # Preprocess audio
-    for frames in preprocess(
-        audio,
+    return from_audios(
+        [audio],
         sample_rate,
         hopsize,
+        fmin,
+        fmax,
+        checkpoint,
         batch_size,
-        center
-    ):
+        center,
+        decoder,
+        interp_unvoiced_at,
+        gpu)[0]
 
-        # Copy to device
-        with torchutil.time.context('copy-to'):
-            frames = frames.to(device)
 
-        # Infer
-        inferred = infer(frames, checkpoint).detach()
+def from_audios(
+        audios: Sequence[torch.Tensor],
+        sample_rate: Union[int, Sequence[int]] = penn.SAMPLE_RATE,
+        hopsize: float = penn.HOPSIZE_SECONDS,
+        fmin: float = penn.FMIN,
+        fmax: float = penn.FMAX,
+        checkpoint: Optional[Path] = None,
+        batch_size: Optional[int] = None,
+        center: str = 'half-window',
+        decoder: str = penn.DECODER,
+        interp_unvoiced_at: Optional[float] = None,
+        gpu: Optional[int] = None
+) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+    """Perform batched pitch and periodicity estimation on many signals
 
-        if batch_size is None:
+    Frames from all signals are packed into shared fixed-size batches for the
+    network, and many signals are decoded in a single batched Viterbi call.
 
-            # Postprocess full file
-            with torchutil.time.context('postprocess'):
-                _, pitch, periodicity = postprocess(
-                    inferred,
-                    fmin,
-                    fmax,
-                    decoder)
+    Args:
+        audios: The audio signals to extract pitch and periodicity from
+        sample_rate: The audio sample rate, or one sample rate per signal
+        hopsize: The hopsize in seconds
+        fmin: The minimum allowable frequency in Hz
+        fmax: The maximum allowable frequency in Hz
+        checkpoint: The checkpoint file
+        batch_size: The number of frames per batch
+        center: Padding options. One of ['half-window', 'half-hop', 'zero'].
+        decoder: Posteriorgram decoder. One of ['argmax', 'pyin', 'viterbi'].
+        interp_unvoiced_at: Specifies voicing threshold for interpolation
+        gpu: The index of the gpu to run inference on
 
-        elif decoder == 'argmax':
+    Returns:
+        List of (pitch, periodicity) for each signal, where
+            pitch: torch.tensor(
+                shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
+            periodicity: torch.tensor(
+                shape=(1, int(samples // penn.seconds_to_sample(hopsize))))
+    """
+    if isinstance(sample_rate, (int, float)):
+        sample_rates = [sample_rate] * len(audios)
+    else:
+        sample_rates = list(sample_rate)
+        if len(sample_rates) != len(audios):
+            raise ValueError(
+                f'Received {len(sample_rates)} sample rates for '
+                f'{len(audios)} signals')
 
-            # Postprocess partial file
-            with torchutil.time.context('postprocess'):
-                result = postprocess(inferred, fmin, fmax, decoder)
-                pitch.append(result[1])
-                periodicity.append(result[2])
-
-        else:
-
-            # Save logits off GPU for later decoding
-            logits.append(inferred.cpu())
-
-    if batch_size is not None:
-
-        if decoder == 'argmax':
-
-                # Concatenate results
-                pitch = torch.cat(pitch, 1)
-                periodicity = torch.cat(periodicity, 1)
-
-        else:
-
-                # Postprocess full file
-                _, pitch, periodicity = postprocess(
-                    torch.cat(logits, 0).to(device),
-                    fmin,
-                    fmax,
-                    decoder)
-
-    # Maybe interpolate unvoiced regions
-    if interp_unvoiced_at is not None:
-        pitch = penn.voicing.interpolate(
-            pitch,
-            periodicity,
-            interp_unvoiced_at)
-
-    return pitch, periodicity
+    # Inference
+    engine = Engine(
+        hopsize,
+        fmin,
+        fmax,
+        checkpoint,
+        batch_size,
+        center,
+        decoder,
+        interp_unvoiced_at,
+        gpu)
+    results = [None] * len(audios)
+    for group in engine(zip(range(len(audios)), audios, sample_rates)):
+        for index, pitch, periodicity in group:
+            results[index] = (pitch, periodicity)
+    return results
 
 
 def from_file(
@@ -160,7 +172,7 @@ def from_file(
     """
     # Load audio
     with torchutil.time.context('load'):
-        audio, sample_rate = torchaudio.load(file)
+        audio, sample_rate = penn.load.read(file)
 
     # Inference
     return from_audio(
@@ -222,16 +234,13 @@ def from_file_to_file(
     with torchutil.time.context('copy-from'):
         pitch, periodicity = pitch.cpu(), periodicity.cpu()
 
+    # Maybe use same filename with new extension
+    if output_prefix is None:
+        output_prefix = Path(file).parent / Path(file).stem
+
     # Save to disk
     with torchutil.time.context('save'):
-
-        # Maybe use same filename with new extension
-        if output_prefix is None:
-            output_prefix = file.parent / file.stem
-
-        # Save
-        torch.save(pitch, f'{output_prefix}-pitch.pt')
-        torch.save(periodicity, f'{output_prefix}-periodicity.pt')
+        _save(output_prefix, pitch, periodicity)
 
 
 def from_files_to_files(
@@ -261,254 +270,301 @@ def from_files_to_files(
         center: Padding options. One of ['half-window', 'half-hop', 'zero'].
         decoder: Posteriorgram decoder. One of ['argmax', 'pyin', 'viterbi'].
         interp_unvoiced_at: Specifies voicing threshold for interpolation
-        num_workers: Number of CPU threads for async data I/O
+        num_workers: Number of CPU worker processes for audio decoding
         gpu: The index of the gpu to run inference on
     """
+    files = [Path(file) for file in files]
+
     # Maybe use default output filenames
     if output_prefixes is None:
         output_prefixes = [file.parent / file.stem for file in files]
 
-    # Single-threaded
-    if num_workers == 0:
+    # Decode audio in worker processes
+    device = _device(gpu)
+    loader = torch.utils.data.DataLoader(
+        AudioFiles(files),
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=device.type == 'cuda',
+        prefetch_factor=4 if num_workers else None,
+        multiprocessing_context=_worker_context() if num_workers else None)
 
-        # Iterate over files
-        for i, (file, output_prefix) in torchutil.iterator(
-            enumerate(zip(files, output_prefixes)),
-            f'{penn.CONFIG}',
-            total=len(files)
-        ):
+    # Inference
+    engine = Engine(
+        hopsize,
+        fmin,
+        fmax,
+        checkpoint,
+        batch_size,
+        center,
+        decoder,
+        interp_unvoiced_at,
+        gpu)
 
-            # Infer
-            from_file_to_file(
-                file,
-                output_prefix,
-                hopsize,
-                fmin,
-                fmax,
-                checkpoint,
-                batch_size,
-                center,
-                decoder,
-                interp_unvoiced_at,
-                gpu)
+    # Setup progress bar
+    progress = torchutil.iterator(
+        range(len(files)),
+        penn.CONFIG,
+        total=len(files))
 
-    # Multi-threaded
-    else:
-
-        # Initialize multi-threaded dataloader
-        loader = inference_loader(
-            files,
-            hopsize,
-            batch_size,
-            center,
-            int(math.ceil(num_workers / 2)))
-
-        # Maintain file correspondence
-        output_prefixes = {
-            file: output_prefix
-            for file, output_prefix in zip(files, output_prefixes)}
-
-        # Setup multiprocessing
-        futures = []
-        pool = mp.get_context('spawn').Pool(max(1, num_workers // 2))
-
-        # Setup progress bar
-        progress = torchutil.iterator(
-            range(len(files)),
-            penn.CONFIG,
-            total=len(files))
-
+    # Save in background threads
+    futures = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         try:
+            for group in engine(loader):
 
-            device = 'cpu' if gpu is None else f'cuda:{gpu}'
+                # Copy results of the whole group in one transfer
+                with torchutil.time.context('copy-from'):
+                    group = _to_cpu(group)
 
-            # Track residual to fill batch
-            residual_files = []
-            residual_frames = torch.zeros((0, 1, 1024))
-            residual_lengths = torch.zeros((0,), dtype=torch.long)
+                for index, pitch, periodicity in group:
+                    futures.add(executor.submit(
+                        _save,
+                        output_prefixes[index],
+                        pitch,
+                        periodicity))
 
-            # Storage for batching within files
-            if batch_size is not None:
-                if decoder == 'argmax':
-                    pitch, periodicity = torch.zeros((1, 0)), torch.zeros((1, 0))
-                else:
-                    logits = torch.zeros((1, 0, 0))
+                # Bound the number of pending writes and raise write errors
+                while len(futures) > 256:
+                    done, futures = concurrent.futures.wait(
+                        futures,
+                        return_when=concurrent.futures.FIRST_COMPLETED)
+                    for future in done:
+                        future.result()
 
-            # Iterate over data
-            num_inferred_unsaved = 0
-            for frames, lengths, input_files in loader:
+                progress.update(len(group))
 
-                # Prepend residual
-                if residual_files:
-                    frames = torch.cat((residual_frames, frames), dim=0)
-                    lengths = torch.cat((residual_lengths, lengths))
-                    input_files = residual_files + input_files
-
-                i = 0
-                while batch_size is None or i + batch_size <= len(frames):
-
-                    # Copy to device
-                    size = len(frames) if batch_size is None else batch_size
-                    batch_frames = frames[i:i + size].to(device)
-
-                    # Infer
-                    inferred = infer(batch_frames, checkpoint).detach()
-                    i += len(batch_frames)
-                    num_inferred_unsaved += len(batch_frames)
-
-                    if batch_size is None:
-
-                        # Postprocess full file
-                        _, pitch, periodicity = postprocess(
-                            inferred,
-                            fmin,
-                            fmax,
-                            decoder)
-                        break
-
-                    elif decoder == 'argmax':
-
-                        # Postprocess partial file
-                        results = postprocess(inferred, fmin, fmax, decoder)
-                        pitch = torch.cat((pitch, results[1].cpu()), dim=1)
-                        periodicity = torch.cat(
-                            (periodicity, results[2].cpu()),
-                            dim=1)
-
-                    else:
-
-                        # Save logits for later decoding
-                        # NOTE - This differs from from_audio and does not
-                        #        handle large files that do not fit on GPU.
-                        #        However, it saves a GPU -> CPU -> GPU copy.
-                        logits = torch.cat((logits, inferred), dim=0)
-
-                # Save to disk
-                j, k = 0, 0
-                for length, file in zip(lengths, input_files):
-
-                    # Slice and save in another process
-                    if j + length <= num_inferred_unsaved:
-
-                        if batch_size is not None:
-
-                            if decoder == 'argmax':
-
-                                # Slice results
-                                save_pitch = pitch[:, j:j + length]
-                                save_periodicity = periodicity[:, j:j + length]
-
-                            else:
-
-                                # Postprocess full file
-                                _, save_pitch, save_periodicity = postprocess(
-                                    logits[j:j + length],
-                                    fmin,
-                                    fmax,
-                                    decoder)
-
-                        # Async save
-                        futures.append(
-                            pool.apply_async(
-                                save_worker,
-                                args=(
-                                    output_prefixes[file],
-                                    save_pitch,
-                                    save_periodicity,
-                                    interp_unvoiced_at)))
-                        while len(futures) > 100:
-                            futures = [f for f in futures if not f.ready()]
-                            time.sleep(.1)
-
-                        j += length
-                        k += 1
-                        progress.update()
-                    else:
-                        break
-
-                # Setup residual for next iteration
-                num_inferred_unsaved -= j
-                pitch = pitch[:, j:]
-                periodicity = periodicity[:, j:]
-                logits = logits[j:]
-                residual_files = input_files[k:]
-                residual_lengths = lengths[k:]
-                residual_frames = frames[i:]
-
-            # Handle final files
-            if residual_frames.numel():
-
-                # Copy to device
-                batch_frames = residual_frames.to(device)
-
-                # Infer
-                inferred = infer(batch_frames, checkpoint).detach()
-                num_inferred_unsaved += len(batch_frames)
-
-                if decoder == 'argmax':
-
-                    # Postprocess partial file
-                    results = postprocess(inferred, fmin, fmax, decoder)
-                    pitch = torch.cat((pitch, results[1].cpu()), dim=1)
-                    periodicity = torch.cat(
-                        (periodicity, results[2].cpu()),
-                        dim=1)
-
-                else:
-
-                    # Save logits for later decoding
-                    # NOTE - This differs from from_audio and does not
-                    #        handle large files that do not fit on GPU.
-                    #        However, it saves a GPU -> CPU -> GPU copy.
-                    logits = torch.cat((logits, inferred), dim=0)
-
-                # Save
-                i = 0
-                for length, file in zip(residual_lengths, residual_files):
-
-                    if decoder == 'argmax':
-
-                        # Slice results
-                        save_pitch = pitch[:, i:i + length]
-                        save_periodicity = periodicity[:, i:i + length]
-
-                    else:
-
-                        # Postprocess full file
-                        _, save_pitch, save_periodicity = postprocess(
-                            logits[i:i + length],
-                            fmin,
-                            fmax,
-                            decoder)
-
-                    # Slice and save in another process
-                    if i + length <= num_inferred_unsaved:
-                        futures.append(
-                            pool.apply_async(
-                                save_worker,
-                                args=(
-                                    output_prefixes[file],
-                                    save_pitch,
-                                    save_periodicity,
-                                    interp_unvoiced_at)))
-                        while len(futures) > 100:
-                            futures = [f for f in futures if not f.ready()]
-                            time.sleep(.1)
-                        i += length
-                        progress.update()
-
-            # Wait
-            for future in futures:
-                future.wait()
+            # Wait for all writes
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
 
         finally:
 
-            # Shutdown multiprocessing
-            pool.close()
-            pool.join()
-
             # Close progress bar
             progress.close()
+
+
+###############################################################################
+# Batched inference engine
+###############################################################################
+
+
+@dataclasses.dataclass(eq=False)
+class Signal:
+    """A signal framed lazily on the inference device"""
+
+    # User-provided identifier
+    key: Any
+
+    # Padded mono audio at penn.SAMPLE_RATE
+    audio: torch.Tensor
+
+    # Number of output frames
+    frames: int
+
+    # Integer hopsize in samples; None if starts is used
+    hopsize: Optional[int]
+
+    # Frame start samples for non-integer hopsizes
+    starts: Optional[torch.Tensor]
+
+    # Number of frames that have been sent to the network
+    cursor: int = 0
+
+    # Network outputs
+    logits: List[torch.Tensor] = dataclasses.field(default_factory=list)
+
+    def slice(self, start: int, stop: int) -> torch.Tensor:
+        """Frames [start, stop) as shape=(stop - start, 1, penn.WINDOW_SIZE)"""
+        if self.starts is None:
+            audio = self.audio[
+                start * self.hopsize:
+                (stop - 1) * self.hopsize + penn.WINDOW_SIZE]
+            frames = audio.unfold(0, penn.WINDOW_SIZE, self.hopsize)
+        else:
+            indices = self.starts[start:stop, None] + torch.arange(
+                penn.WINDOW_SIZE,
+                device=self.starts.device)
+            frames = self.audio[indices]
+        return frames[:, None]
+
+
+class Engine:
+    """Batched pitch and periodicity estimation over a stream of signals
+
+    Arguments are the same as penn.from_audio. Calling an engine on an
+    iterable of (key, audio, sample_rate) yields lists of
+    (key, pitch, periodicity) as groups of signals finish decoding.
+    """
+
+    def __init__(
+        self,
+        hopsize: float = penn.HOPSIZE_SECONDS,
+        fmin: float = penn.FMIN,
+        fmax: float = penn.FMAX,
+        checkpoint: Optional[Path] = None,
+        batch_size: Optional[int] = None,
+        center: str = 'half-window',
+        decoder: str = penn.DECODER,
+        interp_unvoiced_at: Optional[float] = None,
+        gpu: Optional[int] = None
+    ):
+        self.hopsize = hopsize
+        self.fmin = fmin
+        self.fmax = fmax
+        self.center = center
+        self.decoder = decoder
+        self.interp_unvoiced_at = interp_unvoiced_at
+        self.device = _device(gpu)
+        self.batch_size = (
+            penn.EVALUATION_BATCH_SIZE if batch_size is None else batch_size)
+
+        # Load model
+        with torchutil.time.context('model'):
+            self.compiled = (
+                penn.COMPILE and
+                self.device.type == 'cuda' and
+                penn.viterbi.core.triton_available())
+            self.model = (
+                _compiled_model(checkpoint, self.device) if self.compiled
+                else _model(checkpoint, self.device))
+
+    def __call__(
+        self,
+        signals: Iterable[Tuple[Any, torch.Tensor, int]]
+    ) -> Iterator[List[Tuple[Any, torch.Tensor, torch.Tensor]]]:
+        pending = collections.deque()
+        completed = []
+        pending_frames = 0
+
+        for key, audio, sample_rate in signals:
+
+            # Prepare signal for inference
+            signal = self.prepare(key, audio, sample_rate)
+            pending.append(signal)
+            pending_frames += signal.frames
+
+            # Infer full batches
+            while pending_frames >= self.batch_size:
+                pending_frames -= self.infer(pending, completed)
+
+                # Decode groups of signals
+                if sum(signal.frames for signal in completed) >= max(
+                    self.batch_size,
+                    penn.DECODER_BATCH_FRAMES
+                ):
+                    yield self.decode(completed)
+                    completed = []
+
+        # Infer final partial batch
+        while pending:
+            self.infer(pending, completed)
+
+        # Decode remaining signals
+        if completed:
+            yield self.decode(completed)
+
+    def decode(self, signals: List[Signal]):
+        """Decode a group of signals"""
+        results = []
+        with torchutil.time.context('postprocess'), torch.inference_mode():
+            for group in _length_groups(signals):
+
+                # Pad to equal length
+                logits = torch.nn.utils.rnn.pad_sequence(
+                    [torch.cat(signal.logits) for signal in group],
+                    batch_first=True)
+                lengths = torch.tensor(
+                    [signal.frames for signal in group],
+                    device=logits.device)
+                for signal in group:
+                    signal.logits = []
+
+                # Decode
+                _, pitch, periodicity = _postprocess(
+                    logits,
+                    lengths,
+                    self.fmin,
+                    self.fmax,
+                    self.decoder)
+
+                for i, signal in enumerate(group):
+                    signal_pitch = pitch[i:i + 1, :signal.frames]
+                    signal_periodicity = periodicity[i:i + 1, :signal.frames]
+
+                    # Maybe interpolate unvoiced regions
+                    if self.interp_unvoiced_at is not None:
+                        signal_pitch = penn.voicing.interpolate(
+                            signal_pitch,
+                            signal_periodicity,
+                            self.interp_unvoiced_at)
+
+                    results.append(
+                        (signal.key, signal_pitch, signal_periodicity))
+
+        return results
+
+    def infer(self, pending: collections.deque, completed: List[Signal]):
+        """Infer one batch of frames packed from pending signals"""
+        # Pack frames
+        segments, size = [], 0
+        while pending and size < self.batch_size:
+            signal = pending[0]
+            count = min(signal.frames - signal.cursor, self.batch_size - size)
+            segments.append((signal, signal.cursor, signal.cursor + count))
+            signal.cursor += count
+            size += count
+            if signal.cursor == signal.frames:
+                completed.append(pending.popleft())
+        frames = torch.cat([
+            signal.slice(start, stop) for signal, start, stop in segments])
+
+        # Keep shapes static for compiled models
+        if self.compiled and size < self.batch_size:
+            frames = torch.nn.functional.pad(
+                frames,
+                (0, 0, 0, 0, 0, self.batch_size - size))
+
+        # Infer
+        with torchutil.time.context('infer'):
+            with (
+                torch.inference_mode(),
+                _autocast(self.device),
+                _cudnn_benchmark()
+            ):
+                logits = self.model(frames)[:size, :, 0]
+
+            # If we're benchmarking, make sure inference finishes within timer
+            if penn.BENCHMARK and self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+
+        # Distribute outputs
+        offset = 0
+        for signal, start, stop in segments:
+            signal.logits.append(logits[offset:offset + stop - start])
+            offset += stop - start
+
+        return size
+
+    def prepare(self, key, audio, sample_rate) -> Signal:
+        """Prepare a signal for inference"""
+        with torchutil.time.context('copy-to'):
+            audio = audio.to(self.device, non_blocking=True)
+        return _prepare(key, audio, sample_rate, self.hopsize, self.center)
+
+
+class AudioFiles(torch.utils.data.Dataset):
+    """Decode audio files at their native sample rates"""
+
+    def __init__(self, files: Sequence[Path]):
+        self.files = list(files)
+
+    def __getitem__(self, index):
+        audio, sample_rate = penn.load.read(self.files[index])
+        return index, audio, sample_rate
+
+    def __len__(self):
+        return len(self.files)
 
 
 ###############################################################################
@@ -520,42 +576,14 @@ def infer(frames, checkpoint=None):
     """Forward pass through the model"""
     # Time model loading
     with torchutil.time.context('model'):
-
-        # Load and cache model
-        if (
-            not hasattr(infer, 'model') or
-            infer.checkpoint != checkpoint or
-            infer.device != frames.device
-        ):
-
-            # Initialize model
-            model = penn.Model()
-
-            # Maybe download from HuggingFace
-            if checkpoint is None:
-                checkpoint = huggingface_hub.hf_hub_download(
-                    'maxrmorrison/fcnf0-plus-plus',
-                    'fcnf0++.pt')
-                infer.checkpoint = None
-            else:
-                infer.checkpoint = checkpoint
-            checkpoint = torch.load(checkpoint, map_location='cpu')
-
-            # Load from disk
-            model.load_state_dict(checkpoint['model'])
-            infer.device = frames.device
-
-            # Move model to correct device (no-op if devices are the same)
-            infer.model = model.to(frames.device)
+        network = _model(checkpoint, frames.device)
 
     # Time inference
     with torchutil.time.context('infer'):
 
-        # Prepare model for inference
-        with inference_context(infer.model):
-
-            # Infer
-            logits = infer.model(frames)
+        # Infer
+        with torch.inference_mode(), _autocast(frames.device):
+            logits = network(frames)
 
         # If we're benchmarking, make sure inference finishes within timer
         if penn.BENCHMARK and logits.device.type == 'cuda':
@@ -565,50 +593,23 @@ def infer(frames, checkpoint=None):
 
 
 def postprocess(logits, fmin=penn.FMIN, fmax=penn.FMAX, decoder=penn.DECODER):
-    """Convert model output to pitch and periodicity"""
-    # Cache decoder
-    if (
-        not hasattr(postprocess, 'decoder') or
-        postprocess.decoder_name != decoder
-    ):
-        if decoder == 'argmax':
-            postprocess.decoder = penn.decode.Argmax()
-        elif decoder == 'pyin':
-            postprocess.decoder = penn.decode.PYIN()
-        elif decoder == 'viterbi':
-            postprocess.decoder = penn.decode.Viterbi()
-        else:
-            raise ValueError(f'Decoder method {decoder} is not defined')
-        postprocess.decoder_name = decoder
+    """Convert model output to pitch and periodicity
 
-    # Turn off gradients
+    Arguments
+        logits
+            shape=(frames, penn.PITCH_BINS, 1)
+
+    Returns
+        bins, pitch, periodicity
+            shape=(1, frames)
+    """
     with torch.inference_mode():
-
-        # Convert frequency range to pitch bin range
-        minidx = penn.convert.frequency_to_bins(torch.tensor(fmin))
-        maxidx = penn.convert.frequency_to_bins(
-            torch.tensor(fmax),
-            torch.ceil)
-
-        # Remove frequencies outside of allowable range
-        logits[:, :minidx] = -float('inf')
-        logits[:, maxidx:] = -float('inf')
-
-        # Decode pitch from logits
-        bins, pitch = postprocess.decoder(logits)
-
-        # Decode periodicity from logits
-        if penn.PERIODICITY == 'entropy':
-            periodicity = penn.periodicity.entropy(logits)
-        elif penn.PERIODICITY == 'max':
-            periodicity = penn.periodicity.max(logits)
-        elif penn.PERIODICITY == 'sum':
-            periodicity = penn.periodicity.sum(logits)
-        else:
-            raise ValueError(
-                f'Periodicity method {penn.PERIODICITY} is not defined')
-
-        return bins.T, pitch.T, periodicity.T
+        return _postprocess(
+            logits[:, :, 0][None],
+            None,
+            fmin,
+            fmax,
+            decoder)
 
 
 def preprocess(
@@ -618,208 +619,51 @@ def preprocess(
     batch_size=None,
     center='half-window'):
     """Convert audio to model input"""
-    # Get number of frames
-    total_frames = expected_frames(
-        audio.shape[-1],
-        sample_rate,
-        hopsize,
-        center)
-
-    # Maybe resample
-    if sample_rate != penn.SAMPLE_RATE:
-        audio = resample(audio, sample_rate)
-
-    # Maybe pad audio
-    hopsize = penn.convert.seconds_to_samples(hopsize)
-    if center in ['half-hop', 'zero']:
-        if center == 'half-hop':
-            padding = int((penn.WINDOW_SIZE - hopsize) / 2)
-        else:
-            padding = int(penn.WINDOW_SIZE / 2)
-        audio = torch.nn.functional.pad(
-            audio,
-            (padding, padding),
-            mode='reflect')
-
-    # Integer hopsizes permit a speedup using torch.unfold
-    if isinstance(hopsize, int) or hopsize.is_integer():
-        hopsize = int(round(hopsize))
-        start_idxs = None
-
-    else:
-
-        # Find start indices
-        start_idxs = torch.round(
-            torch.tensor([hopsize * i for i in range(total_frames + 1)])
-        ).int()
+    signal = _prepare(None, audio, sample_rate, hopsize, center)
 
     # Default to running all frames in a single batch
-    batch_size = total_frames if batch_size is None else batch_size
+    batch_size = signal.frames if batch_size is None else batch_size
 
     # Generate batches
-    for i in range(0, total_frames, batch_size):
-
-        # Size of this batch
-        batch = min(total_frames - i, batch_size)
-
-        # Fast implementation for integer hopsizes
-        if start_idxs is None:
-
-            # Batch indices
-            start = i * hopsize
-            end = start + int((batch - 1) * hopsize) + penn.WINDOW_SIZE
-            end = min(end, audio.shape[-1])
-            batch_audio = audio[:, start:end]
-
-            # Maybe pad to a single frame
-            if end - start < penn.WINDOW_SIZE:
-                padding = penn.WINDOW_SIZE - (end - start)
-
-                # Handle multiple of hopsize
-                remainder = (end - start) % hopsize
-                if remainder:
-                    padding += end - start - hopsize
-
-                # Pad
-                batch_audio = torch.nn.functional.pad(
-                    batch_audio,
-                    (0, padding))
-
-            # Slice and chunk audio
-            frames = torch.nn.functional.unfold(
-                batch_audio[:, None, None],
-                kernel_size=(1, penn.WINDOW_SIZE),
-                stride=(1, hopsize)).permute(2, 0, 1)
-
-        # Slow implementation for floating-point hopsizes
-        else:
-
-            # Allocate frames
-            frames = torch.zeros(batch, 1, penn.WINDOW_SIZE)
-
-            # Fill each frame with a window starting at the start index
-            for j in range(batch):
-                start = start_idxs[i + j]
-                end = min(start + penn.WINDOW_SIZE, audio.shape[-1])
-                frames[j, :, : end - start] = audio[:, start:end]
-
-        yield frames
+    for i in range(0, signal.frames, batch_size):
+        yield signal.slice(i, min(i + batch_size, signal.frames)).contiguous()
 
 
-###############################################################################
-# Inference acceleration
-###############################################################################
-
-
-def inference_collate(batch):
-    frames, lengths, files = zip(*batch)
-    return (
-        torch.cat(frames, dim=0),
-        torch.tensor(lengths, dtype=torch.long),
-        files)
-
-
-def inference_loader(
-    files,
-    hopsize=penn.HOPSIZE_SECONDS,
-    batch_size=None,
-    center='half-window',
-    num_workers=penn.NUM_WORKERS // 2
-):
-    dataset = InferenceDataset(files, hopsize, batch_size, center)
-    return torch.utils.data.DataLoader(
-        dataset,
-        batch_sampler=InferenceSampler(dataset),
-        num_workers=num_workers,
-        collate_fn=inference_collate)
-
-
-def save_worker(prefix, pitch, periodicity, interp_unvoiced_at=None):
+def _save(prefix, pitch, periodicity):
     """Save pitch and periodicity to disk"""
-    # Maybe interpolate unvoiced regions
-    if interp_unvoiced_at is not None:
-        pitch = penn.voicing.interpolate(
-            pitch,
-            periodicity,
-            interp_unvoiced_at)
-
-    # Save
     Path(prefix).parent.mkdir(exist_ok=True, parents=True)
     torch.save(pitch, f'{prefix}-pitch.pt')
     torch.save(periodicity, f'{prefix}-periodicity.pt')
 
-    # Clean-up
-    del pitch
-    del periodicity
+
+###############################################################################
+# Model loading
+###############################################################################
 
 
-class InferenceDataset(torch.utils.data.Dataset):
+@functools.cache
+def _model(checkpoint=None, device='cpu'):
+    """Load and cache a model for inference"""
+    network = penn.Model()
 
-    def __init__(
-        self,
-        files,
-        hopsize=penn.HOPSIZE_SECONDS,
-        batch_size=None,
-        center='half-window'):
-        self.files = files
-        self.batch_size = batch_size
-        self.lengths = []
-        for file in files:
-            info = torchaudio.info(file)
-            self.lengths.append(
-                expected_frames(
-                    info.num_frames,
-                    info.sample_rate,
-                    hopsize,
-                    center))
-        self.preprocess_fn = functools.partial(
-            preprocess,
-            hopsize=hopsize,
-            batch_size=batch_size,
-            center=center)
+    # Maybe download from HuggingFace
+    if checkpoint is None:
+        checkpoint = huggingface_hub.hf_hub_download(
+            'maxrmorrison/fcnf0-plus-plus',
+            'fcnf0++.pt')
 
-    def __getitem__(self, index):
-        frames = torch.cat(
-            [
-                frame for frame in
-                self.preprocess_fn(*torchaudio.load(self.files[index]))
-            ],
-            dim=0)
-        return frames, self.lengths[index], self.files[index]
+    # Load from disk
+    state = torch.load(checkpoint, map_location='cpu', weights_only=True)
+    network.load_state_dict(state['model'])
 
-    def __len__(self):
-        return len(self.files)
+    # Prepare for inference
+    return network.to(device).eval()
 
 
-class InferenceSampler(torch.utils.data.Sampler):
-
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __iter__(self):
-        return iter(self.batch)
-
-    def __len__(self):
-        return len(self.batch)
-
-    @functools.cached_property
-    def batch(self):
-        count = 0
-        batch, batches = [], []
-        for i, length in enumerate(self.dataset.lengths):
-            batch.append(i)
-            if self.dataset.batch_size is None:
-                batches.append(batch)
-                batch = []
-            else:
-                count += length
-                if count >= self.dataset.batch_size:
-                    batches.append(batch)
-                    batch = []
-                    count = 0
-        if batch:
-            batches.append(batch)
-        return batches
+@functools.cache
+def _compiled_model(checkpoint=None, device='cuda'):
+    """Load, compile, and cache a model for inference"""
+    return torch.compile(_model(checkpoint, device), dynamic=False)
 
 
 ###############################################################################
@@ -914,9 +758,217 @@ def normalize(frames):
 
 
 def resample(audio, sample_rate, target_rate=penn.SAMPLE_RATE):
-    """Perform audio resampling"""
+    """Perform audio resampling
+
+    Bandlimited windowed-sinc interpolation equivalent to
+    torchaudio.transforms.Resample with default arguments. Adapted from
+    torchaudio (BSD 2-Clause License, Copyright (c) 2017 Facebook Inc.
+    (Soumith Chintala)).
+    """
     if sample_rate == target_rate:
         return audio
-    resampler = torchaudio.transforms.Resample(sample_rate, target_rate)
-    resampler = resampler.to(audio.device)
-    return resampler(audio)
+    gcd = math.gcd(int(sample_rate), int(target_rate))
+    orig_freq, new_freq = int(sample_rate) // gcd, int(target_rate) // gcd
+    kernel, width = _resample_kernel(orig_freq, new_freq, audio.device)
+
+    # Pack batch
+    shape = audio.size()
+    audio = audio.reshape(-1, shape[-1])
+    num_wavs, length = audio.shape
+
+    # Resample
+    audio = torch.nn.functional.pad(audio, (width, width + orig_freq))
+    resampled = torch.nn.functional.conv1d(
+        audio[:, None],
+        kernel.to(audio.dtype),
+        stride=orig_freq)
+    resampled = resampled.transpose(1, 2).reshape(num_wavs, -1)
+    target_length = int(
+        torch.ceil(torch.as_tensor(new_freq * length / orig_freq)))
+    resampled = resampled[..., :target_length]
+
+    # Unpack batch
+    return resampled.view(shape[:-1] + resampled.shape[-1:])
+
+
+def _autocast(device):
+    """Mixed precision for CUDA inference"""
+    if torch.device(device).type == 'cuda':
+        return torch.autocast('cuda')
+    return contextlib.nullcontext()
+
+
+@contextlib.contextmanager
+def _cudnn_benchmark():
+    """Select the fastest cuDNN convolution algorithms for static shapes"""
+    previous = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = True
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previous
+
+
+def _device(gpu):
+    """Get the torch device for a gpu index"""
+    return torch.device('cpu' if gpu is None else f'cuda:{gpu}')
+
+
+@functools.cache
+def _decoder(name):
+    """Get and cache a decoder by name"""
+    if name == 'argmax':
+        return penn.decode.Argmax()
+    if name == 'pyin':
+        return penn.decode.PYIN()
+    if name == 'viterbi':
+        return penn.decode.Viterbi()
+    raise ValueError(f'Decoder method {name} is not defined')
+
+
+def _worker_context():
+    """Start method for data workers; avoids forking a multithreaded process"""
+    methods = torch.multiprocessing.get_all_start_methods()
+    return 'forkserver' if 'forkserver' in methods else 'spawn'
+
+
+def _length_groups(signals, max_padding=2.):
+    """Group signals by length to bound padding when batch decoding"""
+    signals = sorted(signals, key=lambda signal: signal.frames, reverse=True)
+    groups, group, total = [], [], 0
+    for signal in signals:
+        if group and (len(group) + 1) * group[0].frames > \
+                max_padding * (total + signal.frames):
+            groups.append(group)
+            group, total = [], 0
+        group.append(signal)
+        total += signal.frames
+    if group:
+        groups.append(group)
+    return groups
+
+
+def _postprocess(logits, lengths, fmin, fmax, decoder):
+    """Decode a batch of logits
+
+    Arguments
+        logits
+            shape=(batch, frames, penn.PITCH_BINS)
+        lengths
+            shape=(batch,)
+
+    Returns
+        bins, pitch, periodicity
+            shape=(batch, frames)
+    """
+    # Copy so that callers' logits are not modified
+    logits = logits.to(torch.float32, copy=True)
+
+    # Convert frequency range to pitch bin range
+    minidx = penn.convert.frequency_to_bins(torch.tensor(fmin))
+    maxidx = penn.convert.frequency_to_bins(torch.tensor(fmax), torch.ceil)
+
+    # Remove frequencies outside of allowable range
+    logits[..., :minidx] = -float('inf')
+    logits[..., maxidx:] = -float('inf')
+
+    # Decode pitch from logits
+    bins, pitch = _decoder(decoder).batch(logits, lengths)
+
+    # Decode periodicity from logits
+    if penn.PERIODICITY == 'entropy':
+        periodicity = penn.periodicity.entropy(logits, dim=-1)
+    elif penn.PERIODICITY == 'max':
+        periodicity = penn.periodicity.max(logits, dim=-1)
+    elif penn.PERIODICITY == 'sum':
+        periodicity = penn.periodicity.sum(logits, dim=-1)
+    else:
+        raise ValueError(
+            f'Periodicity method {penn.PERIODICITY} is not defined')
+
+    return bins, pitch, periodicity
+
+
+def _prepare(key, audio, sample_rate, hopsize, center):
+    """Convert audio to a lazily-framed signal on the audio's device"""
+    # Convert to mono
+    audio = audio.to(torch.float32)
+    if audio.dim() == 1:
+        audio = audio[None]
+    if audio.shape[0] > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+
+    # Get number of frames
+    frames = expected_frames(audio.shape[-1], sample_rate, hopsize, center)
+
+    # Maybe resample
+    audio = resample(audio, sample_rate)
+
+    # Maybe pad audio
+    hopsize = penn.convert.seconds_to_samples(hopsize)
+    if center in ['half-hop', 'zero']:
+        if center == 'half-hop':
+            padding = int((penn.WINDOW_SIZE - hopsize) / 2)
+        else:
+            padding = int(penn.WINDOW_SIZE / 2)
+        audio = torch.nn.functional.pad(
+            audio,
+            (padding, padding),
+            mode='reflect')
+    audio = audio[0]
+
+    # Integer hopsizes permit zero-copy framing
+    if isinstance(hopsize, int) or hopsize.is_integer():
+        hopsize = int(round(hopsize))
+        starts = None
+        samples = (frames - 1) * hopsize + penn.WINDOW_SIZE
+    else:
+        starts = (
+            torch.arange(frames, dtype=torch.float64) * hopsize
+        ).to(torch.float32).round().to(torch.long)
+        samples = int(starts[-1]) + penn.WINDOW_SIZE
+        starts = starts.to(audio.device)
+        hopsize = None
+
+    # Zero-pad frames that extend past the end of the audio
+    if audio.shape[-1] < samples:
+        audio = torch.nn.functional.pad(audio, (0, samples - audio.shape[-1]))
+
+    return Signal(key, audio, frames, hopsize, starts)
+
+
+@functools.lru_cache(maxsize=16)
+def _resample_kernel(orig_freq, new_freq, device):
+    """Windowed-sinc resampling kernel with torchaudio defaults
+
+    Computed on CPU, as in torchaudio, so results do not depend on device.
+    """
+    lowpass_filter_width, rolloff = 6, .99
+    base_freq = min(orig_freq, new_freq) * rolloff
+    width = math.ceil(lowpass_filter_width * orig_freq / base_freq)
+    idx = torch.arange(
+        -width,
+        width + orig_freq,
+        dtype=torch.float64)[None, None] / orig_freq
+    t = torch.arange(0, -new_freq, -1)[:, None, None] / new_freq + idx
+    t *= base_freq
+    t = t.clamp_(-lowpass_filter_width, lowpass_filter_width)
+    window = torch.cos(t * math.pi / lowpass_filter_width / 2) ** 2
+    t *= math.pi
+    scale = base_freq / orig_freq
+    kernels = torch.where(t == 0, torch.tensor(1.).to(t), t.sin() / t)
+    kernels *= window * scale
+    return kernels.to(device=device, dtype=torch.float32), width
+
+
+def _to_cpu(group):
+    """Copy a group of results to CPU in one transfer"""
+    if not group:
+        return group
+    keys, pitch, periodicity = zip(*group)
+    lengths = [p.shape[-1] for p in pitch]
+    pitch = torch.cat(pitch, dim=1).cpu().split(lengths, dim=1)
+    periodicity = torch.cat(periodicity, dim=1).cpu().split(lengths, dim=1)
+    return [
+        (key, p.clone(), q.clone())
+        for key, p, q in zip(keys, pitch, periodicity)]

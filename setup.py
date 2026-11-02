@@ -12,27 +12,30 @@ setup(
     author='Max Morrison, Caedon Hsieh, Nathan Pruyne, and Bryan Pardo',
     author_email='interactiveaudiolab@gmail.com',
     url='https://github.com/interactiveaudiolab/penn',
+    python_requires='>=3.12',
     extras_require={
         'train': [
-            'librosa',     # 0.9.1
-            'matplotlib',  # 3.6.1
-            'pyworld',     # 0.3.2
-            'scipy',       # 1.9.3
-            'torchcrepe'   # 0.0.17
+            'librosa>=1.0',
+            'matplotlib>=3.11',
+            'pyworld>=0.3.6',
+            'scipy>=1.18',
+            'torchcrepe>=0.0.24'
         ],
         'test': [
-            'librosa',     # 0.9.1
-            'pytest',      # 8.2.2
+            'librosa>=1.0',
+            'pytest>=9.2'
+        ],
+        'triton': [
+            'triton>=3.9'
         ]
     },
     install_requires=[
-        'huggingface_hub', # 0.11.1
-        'numpy',           # 1.23.4
-        'torbi',           # 0.0.1
-        'torch',           # 1.12.1+cu113
-        'torchaudio',      # 0.12.1+cu113
-        'torchutil',       # 0.0.7
-        'yapecs'           # 0.0.6
+        'huggingface_hub>=2.4',
+        'numpy>=2.5',
+        'torch>=2.15',
+        'torchcodec>=0.17',  # Requires FFmpeg
+        'torchutil>=0.1.2',
+        'yapecs>=0.5'
     ],
     packages=find_packages(),
     package_data={'penn': ['assets/*', 'assets/*/*']},
